@@ -1,58 +1,107 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Hiak.VClock where
+module Hiak.VClock (
+   -- * types
+     VClock
+   , Clock(..)
+   -- * functions
+   , empty
+   , lookup
+   , increment
+   , increment1
+   , descends
+   , (===>)
+   , merge
+   , dominates
+   , equal
+   , concurrent
+) where
 
--- import Data.Text as T
--- import Data.Time.Clock.POSIX (POSIXTime(..), getPOSIXTime)
-import Data.List as L
+import Prelude hiding (lookup)
+import qualified Data.List as L
+import Data.Monoid (mappend)
 
-type VClockNode = String
 type VClockCounter = Integer
 type VClockTimestamp = Integer
 
-data VClockE = VClockE {
-                   eNode :: VClockNode
-                 , eCounter :: VClockCounter
-                 , eTimestamp :: VClockTimestamp
-                 } deriving (Show, Eq)
+data Clock a = Clock { actor :: a
+                     , counter :: VClockCounter
+                     , timestamp :: VClockTimestamp
+                     } deriving (Show, Eq)
 
-instance Ord VClockE where
-    compare (VClockE node1 _ _) (VClockE node2 _ _) = compare node1 node2
+instance (Ord a) => Ord (Clock a) where
+    compare (Clock aa ca ta) (Clock ab cb tb)
+      = compare aa ab `mappend` compare ca cb `mappend` compare ta tb
 
-type VClock = [VClockE]
+-- | riak_core-style vector clock.
+-- A type parameter is an actor type.
+data VClock a = VClock [Clock a] deriving (Show, Eq)
 
-empty :: VClock
-empty = []
+-- | Construct an empty vector clock.
+empty :: VClock a
+empty = VClock []
 
-fromEntry :: VClockNode -> VClockCounter -> VClockTimestamp -> VClock
-fromEntry node counter ts = 
-    [VClockE{eNode=node, eCounter=counter, eTimestamp=ts}]
+-- | Lookup a Clock entry for an actor.
+lookup :: (Eq a) => VClock a -> a -> Maybe (Clock a)
+lookup (VClock vclock) actor = go vclock
+  where
+    go (ent@(Clock actor' _ _):vc) | actor' == actor = Just ent
+    go (_:vc) = go vc
+    go [] = Nothing
 
-findEntry :: VClock -> VClockNode -> Maybe VClockE
-findEntry (entry@(VClockE node' _ _):vc) node | node' == node = Just entry
-findEntry (_:vc) node = findEntry vc node
-findEntry [] node = Nothing
-
-descends :: VClock -> VClock -> Bool
-descends _ [] = True
-descends va (VClockE{eNode=nodeB, eCounter=ctrB, eTimestamp=tsB}:vbs) = 
-    lastCounterGTE lastEntry && descends va (vbs)
-      where
-        lastEntry = findEntry va nodeB
-
-        lastCounterGTE (Just VClockE{eCounter=ctrA}) = ctrA >= ctrB
-        lastCounterGTE Nothing = False
-
-increment :: VClock -> VClockNode -> VClockTimestamp -> VClock
-increment vclock node ts = inc' vclock []
+-- | Replace a Clock entry with a matching actor using a function. Adds an
+-- entry a Clock entry if one is not found.
+replace :: (Eq a) => [Clock a] -> a -> (Maybe (Clock a) -> Clock a) -> [Clock a]
+replace vclock actor f = replace' vclock [] False
   where 
-    inc' ((VClockE node' c _):xs) acc | node' == node = (VClockE{eNode=node, eCounter=c+1, eTimestamp=ts}):acc
-    inc' (x:xs) acc = inc' xs (x:acc)
-    inc' [] acc = (VClockE{eNode=node, eCounter=1, eTimestamp=ts}):acc
+    replace' (x@(Clock actor' _ _):xs) acc found
+        | actor' == actor = replace' xs ((f $ Just x):acc) True
+        | otherwise       = replace' xs (x:acc) found
+    replace' [] acc False = (f Nothing):acc
+    replace' [] acc True = acc
 
+-- | Increment a Clock counter for an actor.
+increment :: (Eq a) => VClock a -> a -> VClockTimestamp -> VClock a
+increment (VClock vclock) act ts = VClock $ replace vclock act inc
+  where
+    inc (Just Clock{actor=a, counter=c}) = Clock{actor=a, counter=c+1, timestamp=ts}
+    inc Nothing = Clock{actor=act, counter=1, timestamp=ts}
 
-dominates :: VClock -> VClock -> Bool
-dominates va vb = all (== True) [descends va vb, not $ descends vb va]
+-- | Increment a Clock counter for an actor with timestamp equal to -1.
+increment1 vclock act = increment vclock act (-1)
 
-merge :: [VClock] -> VClock
-merge = undefined
+-- | Test if the first vclock is a direct descendant of the second (partial
+-- ordering property).
+descends :: (Eq a) => VClock a -> VClock a -> Bool
+descends = (===>)
+
+-- | Same as 'descends'.
+(===>) :: (Eq a) => VClock a -> VClock a -> Bool
+a@(VClock va) ===> (VClock vb) = va ==> vb
+  where
+    va ==> [] = True
+    va ==> ((Clock actorB counterB _):vbs) = descends' (lookup a actorB) && va ==> vbs
+      where
+            descends' (Just Clock{counter=counterA}) = counterA >= counterB
+            descends' Nothing = False
+
+-- | Merges two vector clocks.
+merge :: (Eq a, Ord a) => VClock a -> VClock a -> VClock a
+merge (VClock a) (VClock b) = VClock $ L.foldl' folder a b
+  where
+    folder va clock@(Clock actor _ _) = replace va actor (\mc -> case mc of
+                                                                 Nothing -> clock
+                                                                 Just clock' -> max clock clock')
+
+-- | Check if va dominates vb.
+dominates :: (Eq a) => VClock a -> VClock a -> Bool
+dominates va vb = all (== True) [va ===> vb, not $ vb ===> va]
+
+-- | Check if two vector clocks are equal.
+equal :: (Ord a, Eq a) => VClock a -> VClock a -> Bool
+equal (VClock va) (VClock vb) = L.sort va == L.sort vb
+
+-- | Check if two vector clocks are concurrent (riak-style).
+-- See <https://github.com/basho/riak_core/blob/61c2eafba1fa5da4f7fa14ccb767b1eb3a8e706b/src/vclock.erl#L100 riak_core vclock comments>
+concurrent :: (Ord a, Eq a) => VClock a -> VClock a -> Bool
+concurrent a b = all (== True) [descends a b, descends b a, not $ equal a b]
