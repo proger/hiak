@@ -7,6 +7,6 @@ build-type:          Simple
 cabal-version:       >=1.10
 
 library
-  exposed-modules:     Hiak.VClock
-  build-depends:       base, time, text
+  exposed-modules:     Hiak.CHash, Hiak.VClock, Hiak.Ring
+  build-depends:       base, time, text, hashable, SHA, bytestring
   default-language:    Haskell2010
